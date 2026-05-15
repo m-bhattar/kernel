@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+#include <linux/dma-mapping.h>
+#include <linux/device.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/iommu.h>
+#include <linux/slab.h>
+#include "qda_drv.h"
+#include "qda_memory_manager.h"
+#include "qda_cb.h"
+
+static void qda_cb_dev_release(struct device *dev)
+{
+	kfree(dev);
+}
+
+static int qda_configure_cb_iommu(struct device *cb_dev, struct device_node *cb_node)
+{
+	int ret;
+
+	dev_dbg(cb_dev, "Configuring DMA/IOMMU for CB device %s\n", dev_name(cb_dev));
+
+	/* Use of_dma_configure which handles both DMA and IOMMU configuration */
+	ret = of_dma_configure(cb_dev, cb_node, true);
+	if (ret) {
+		dev_err(cb_dev, "of_dma_configure failed for %s: %d\n", dev_name(cb_dev), ret);
+		return ret;
+	}
+
+	dev_dbg(cb_dev, "DMA/IOMMU configured successfully for CB device %s\n", dev_name(cb_dev));
+	return 0;
+}
+
+static int qda_cb_setup_device(struct qda_dev *qdev, struct device *cb_dev)
+{
+	struct qda_iommu_device *iommu_dev;
+	int rc;
+	u32 sid, pa_bits = 32;
+
+	drm_dbg_driver(&qdev->drm_dev, "Setting up CB device %s\n", dev_name(cb_dev));
+
+	iommu_dev = kzalloc_obj(*iommu_dev, GFP_KERNEL);
+	if (!iommu_dev)
+		return -ENOMEM;
+
+	if (of_property_read_u32(cb_dev->of_node, "reg", &sid)) {
+		drm_dbg_driver(&qdev->drm_dev, "No 'reg' property found, defaulting SID to 0\n");
+		sid = 0;
+	}
+
+	rc = dma_set_mask(cb_dev, DMA_BIT_MASK(pa_bits));
+	if (rc) {
+		drm_err(&qdev->drm_dev, "%d bit DMA enable failed: %d\n", pa_bits, rc);
+		kfree(iommu_dev);
+		return rc;
+	}
+
+	iommu_dev->dev = cb_dev;
+	iommu_dev->sid = sid;
+
+	rc = qda_memory_manager_register_device(qdev->iommu_mgr, iommu_dev);
+	if (rc) {
+		drm_err(&qdev->drm_dev, "Failed to register IOMMU device: %d\n", rc);
+		kfree(iommu_dev);
+		return rc;
+	}
+
+	dev_set_drvdata(cb_dev, iommu_dev);
+
+	drm_dbg_driver(&qdev->drm_dev, "CB device setup complete - SID: %u, PA bits: %u\n", sid, pa_bits);
+
+	return 0;
+}
+
+int qda_create_cb_device(struct qda_dev *qdev, struct device_node *cb_node)
+{
+	struct device *cb_dev;
+	int ret;
+	u32 sid = 0;
+	struct qda_cb_dev *entry;
+
+	drm_dbg_driver(&qdev->drm_dev, "Creating CB device for node: %s\n", cb_node->name);
+
+	of_property_read_u32(cb_node, "reg", &sid);
+
+	cb_dev = kzalloc_obj(*cb_dev, GFP_KERNEL);
+	if (!cb_dev)
+		return -ENOMEM;
+
+	device_initialize(cb_dev);
+	cb_dev->parent = qdev->dev;
+	cb_dev->bus = &qda_cb_bus_type; /* Use our custom bus type for IOMMU handling */
+	cb_dev->release = qda_cb_dev_release;
+	dev_set_name(cb_dev, "qda-cb-%s-%u", qdev->dsp_name, sid);
+
+	drm_dbg_driver(&qdev->drm_dev, "Initialized CB device: %s\n", dev_name(cb_dev));
+
+	cb_dev->of_node = of_node_get(cb_node);
+
+	cb_dev->dma_mask = &cb_dev->coherent_dma_mask;
+	cb_dev->coherent_dma_mask = DMA_BIT_MASK(32);
+
+	dev_set_drvdata(cb_dev->parent, qdev);
+
+	ret = device_add(cb_dev);
+	if (ret) {
+		drm_err(&qdev->drm_dev, "Failed to add CB device for SID %u: %d\n", sid, ret);
+		goto cleanup_device_init;
+	}
+
+	drm_dbg_driver(&qdev->drm_dev, "CB device added to system\n");
+
+	ret = qda_configure_cb_iommu(cb_dev, cb_node);
+	if (ret) {
+		drm_err(&qdev->drm_dev, "IOMMU configuration failed: %d\n", ret);
+		goto cleanup_device_add;
+	}
+
+	ret = qda_cb_setup_device(qdev, cb_dev);
+	if (ret) {
+		drm_err(&qdev->drm_dev, "CB device setup failed: %d\n", ret);
+		goto cleanup_device_add;
+	}
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		ret = -ENOMEM;
+		goto cleanup_device_add;
+	}
+
+	entry->dev = cb_dev;
+	list_add_tail(&entry->node, &qdev->cb_devs);
+
+	drm_dbg_driver(&qdev->drm_dev, "Successfully created CB device for SID %u\n", sid);
+	return 0;
+
+cleanup_device_add:
+	device_del(cb_dev);
+cleanup_device_init:
+	of_node_put(cb_dev->of_node);
+	put_device(cb_dev);
+	return ret;
+}
+
+void qda_destroy_cb_device(struct device *cb_dev)
+{
+	struct iommu_group *group;
+	struct qda_iommu_device *iommu_dev;
+	struct qda_dev *qdev;
+
+	if (!cb_dev) {
+		pr_debug("qda: NULL CB device passed to destroy\n");
+		return;
+	}
+
+	dev_dbg(cb_dev, "Destroying CB device %s\n", dev_name(cb_dev));
+
+	iommu_dev = dev_get_drvdata(cb_dev);
+	if (iommu_dev) {
+		if (cb_dev->parent) {
+			qdev = dev_get_drvdata(cb_dev->parent);
+			if (qdev && qdev->iommu_mgr) {
+				dev_dbg(cb_dev, "Unregistering IOMMU device for %s\n",
+					dev_name(cb_dev));
+				qda_memory_manager_unregister_device(qdev->iommu_mgr, iommu_dev);
+			}
+		}
+	}
+
+	group = iommu_group_get(cb_dev);
+	if (group) {
+		dev_dbg(cb_dev, "Removing %s from IOMMU group\n", dev_name(cb_dev));
+		iommu_group_remove_device(cb_dev);
+		iommu_group_put(group);
+	}
+
+	of_node_put(cb_dev->of_node);
+	cb_dev->of_node = NULL;
+	device_unregister(cb_dev);
+
+	pr_debug("qda: CB device destroyed\n");
+}
